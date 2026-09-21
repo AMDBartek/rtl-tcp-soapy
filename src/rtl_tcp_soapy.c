@@ -60,6 +60,16 @@
 #define DEFAULT_READ_ELEMS	16384
 #define READ_TIMEOUT_US		100000
 
+/*
+ * Some devices (for example the PlutoSDR with the Tezuka firmware) cannot
+ * stream below a certain sample rate because the receive FIR needs a valid
+ * setting.  When a client asks for a lower rate, the server runs the hardware
+ * at an integer multiple of the requested rate and decimates the samples.  The
+ * default threshold is the common 1.024 MHz minimum.
+ */
+#define DEFAULT_MIN_HW_RATE	1024000.0
+#define MAX_DECIM_FACTOR	4096
+
 /* Structure sent to the client right after a connection is accepted. */
 typedef struct {			/* size must be 12 bytes */
 	char magic[4];
@@ -104,6 +114,20 @@ typedef struct {
 	int biastee;
 } init_config_t;
 
+/*
+ * A streaming FIR decimator.  The hardware runs at factor times the rate the
+ * client asked for, and every factor-th filtered sample is sent on.
+ */
+typedef struct {
+	size_t factor;		/* decimation factor, 1 means disabled */
+	size_t ntaps;
+	float *coeff;
+	float *hist_i;		/* circular delay line for I */
+	float *hist_q;		/* circular delay line for Q */
+	size_t pos;		/* next write position in the delay lines */
+	size_t phase;		/* input samples counted modulo factor */
+} decimator_t;
+
 typedef struct {
 	SoapySDRDevice *dev;
 	SoapySDRStream *stream;
@@ -117,6 +141,9 @@ typedef struct {
 	size_t gain_count;
 	double gain_min_db;
 	double gain_max_db;
+	decimator_t decim;
+	int decim_enabled;	/* set to 0 with --no-decimate */
+	double min_hw_rate;
 } sdr_ctx_t;
 
 static volatile sig_atomic_t g_do_exit = 0;
@@ -148,6 +175,11 @@ static void usage(const char *prog)
 	printf("\t--listen <addr>    listen address as host:port, :port or host\n");
 	printf("\t-a, --addr <addr>  listen address (default: %s)\n", DEFAULT_ADDR);
 	printf("\t-p, --port <port>  listen port (default: %s)\n", DEFAULT_PORT);
+	printf("Sample rate options:\n");
+	printf("\t--no-decimate      pass low sample rates to the device directly\n");
+	printf("\t                   instead of decimating from a higher rate\n");
+	printf("\t--min-hw-rate <Hz> minimum hardware sample rate (default: %.0f)\n",
+	       DEFAULT_MIN_HW_RATE);
 	printf("Compatibility options:\n");
 	printf("\t--tuner-type <n>   spoofed RTL-SDR tuner type (default: %d, R820T)\n", DEFAULT_TUNER_TYPE);
 	printf("\t-D, --direct-sampling  accepted for compatibility, ignored\n");
@@ -258,6 +290,156 @@ static void set_gain_db(sdr_ctx_t *s, double db)
 			db, soapy_last_error());
 }
 
+/* Free the FIR decimator state and disable decimation. */
+static void decimator_free(decimator_t *d)
+{
+	free(d->coeff);
+	free(d->hist_i);
+	free(d->hist_q);
+	d->coeff = NULL;
+	d->hist_i = NULL;
+	d->hist_q = NULL;
+	d->factor = 1;
+	d->ntaps = 0;
+	d->pos = 0;
+	d->phase = 0;
+}
+
+/*
+ * Design a Hamming windowed-sinc low pass filter and prepare the delay lines.
+ * The cutoff is at the output Nyquist frequency, so the outer edges of the
+ * requested band are filtered off before the samples are decimated.
+ */
+static void decimator_design(decimator_t *d, size_t factor)
+{
+	size_t n, i;
+	double fc = 0.5 / (double)factor;
+	double sum = 0.0;
+
+	decimator_free(d);
+
+	d->factor = factor;
+	d->ntaps = 16 * factor + 1;
+	n = d->ntaps;
+
+	d->coeff = xmalloc(n * sizeof(float));
+	d->hist_i = xmalloc(n * sizeof(float));
+	d->hist_q = xmalloc(n * sizeof(float));
+
+	for (i = 0; i < n; i++) {
+		double m = (double)i - (double)(n - 1) / 2.0;
+		double sinc = (m == 0.0) ? 1.0 :
+			sin(2.0 * M_PI * fc * m) / (2.0 * M_PI * fc * m);
+		double window = 0.54 - 0.46 *
+			cos(2.0 * M_PI * (double)i / (double)(n - 1));
+		d->coeff[i] = (float)(2.0 * fc * sinc * window);
+		sum += d->coeff[i];
+	}
+
+	for (i = 0; i < n; i++)
+		d->coeff[i] /= (float)sum;
+
+	memset(d->hist_i, 0, n * sizeof(float));
+	memset(d->hist_q, 0, n * sizeof(float));
+	d->pos = 0;
+	d->phase = 0;
+}
+
+/*
+ * Filter unsigned 8-bit IQ samples and keep every factor-th output sample.
+ * The filter state stays between calls, so block boundaries are seamless.
+ * Returns the number of complex samples written to out.
+ */
+static size_t decimator_process(decimator_t *d, const uint8_t *in, size_t elems,
+				uint8_t *out)
+{
+	size_t n = d->ntaps;
+	size_t k, t, produced = 0;
+
+	for (k = 0; k < elems; k++) {
+		float sum_i = 0.0f, sum_q = 0.0f;
+		size_t idx;
+		int vi, vq;
+
+		d->hist_i[d->pos] = (float)((int)in[2 * k] - 128);
+		d->hist_q[d->pos] = (float)((int)in[2 * k + 1] - 128);
+		d->pos = (d->pos + 1 == n) ? 0 : d->pos + 1;
+
+		if (++d->phase < d->factor)
+			continue;
+		d->phase = 0;
+
+		idx = d->pos;
+		for (t = 0; t < n; t++) {
+			idx = (idx == 0) ? n - 1 : idx - 1;
+			sum_i += d->coeff[t] * d->hist_i[idx];
+			sum_q += d->coeff[t] * d->hist_q[idx];
+		}
+
+		vi = (int)lrintf(sum_i);
+		vq = (int)lrintf(sum_q);
+		if (vi > 127)
+			vi = 127;
+		else if (vi < -128)
+			vi = -128;
+		if (vq > 127)
+			vq = 127;
+		else if (vq < -128)
+			vq = -128;
+
+		out[2 * produced] = (uint8_t)(vi + 128);
+		out[2 * produced + 1] = (uint8_t)(vq + 128);
+		produced++;
+	}
+
+	return produced;
+}
+
+/*
+ * Set the sample rate.  If the requested rate is below the hardware minimum
+ * and decimation is enabled, the hardware runs at an integer multiple of the
+ * requested rate and the samples are decimated back to the exact rate the
+ * client asked for.
+ */
+static void set_sample_rate(sdr_ctx_t *s, double requested)
+{
+	double hw = requested;
+	size_t factor = 1;
+
+	if (s->decim_enabled && requested > 0.0 &&
+	    s->min_hw_rate > 0.0 && requested < s->min_hw_rate) {
+		factor = (size_t)ceil(s->min_hw_rate / requested);
+		if (factor < 1)
+			factor = 1;
+		if (factor > MAX_DECIM_FACTOR) {
+			fprintf(stderr, "rtl_tcp_soapy: decimation factor limited "
+				"to %d\n", MAX_DECIM_FACTOR);
+			factor = MAX_DECIM_FACTOR;
+		}
+		hw = requested * (double)factor;
+	}
+
+	if (SoapySDRDevice_setSampleRate(s->dev, SOAPY_SDR_RX, s->channel,
+					 hw) != 0) {
+		fprintf(stderr, "rtl_tcp_soapy: failed to set sample rate: %s\n",
+			soapy_last_error());
+		return;
+	}
+
+	if (factor > 1) {
+		decimator_design(&s->decim, factor);
+		printf("sample rate %.0f Hz (hardware %.0f Hz, decimate by %zu)\n",
+		       requested,
+		       SoapySDRDevice_getSampleRate(s->dev, SOAPY_SDR_RX,
+						    s->channel), factor);
+	} else {
+		decimator_free(&s->decim);
+		printf("sample rate set to %.0f Hz\n",
+		       SoapySDRDevice_getSampleRate(s->dev, SOAPY_SDR_RX,
+						    s->channel));
+	}
+}
+
 /*
  * (Re)apply the configuration selected on the command line.  This is called
  * at startup and again for every new client, so that a client which does not
@@ -270,13 +452,7 @@ static void apply_config(sdr_ctx_t *s)
 	const init_config_t *cfg = &s->init;
 	SoapySDRRange range;
 
-	if (SoapySDRDevice_setSampleRate(s->dev, SOAPY_SDR_RX, s->channel,
-					 cfg->rate) != 0)
-		fprintf(stderr, "rtl_tcp_soapy: failed to set sample rate: %s\n",
-			soapy_last_error());
-	else
-		printf("sample rate set to %.0f Hz\n",
-		       SoapySDRDevice_getSampleRate(s->dev, SOAPY_SDR_RX, s->channel));
+	set_sample_rate(s, cfg->rate);
 
 	if (SoapySDRDevice_setFrequency(s->dev, SOAPY_SDR_RX, s->channel,
 					cfg->freq, NULL) != 0)
@@ -552,11 +728,8 @@ static void handle_command(sdr_ctx_t *s, uint8_t cmd, uint32_t param)
 
 	case 0x02:	/* set sample rate */
 		printf("set sample rate %u\n", param);
-		if (param > 0 &&
-		    SoapySDRDevice_setSampleRate(s->dev, SOAPY_SDR_RX, s->channel,
-						 (double)param) != 0)
-			fprintf(stderr, "rtl_tcp_soapy: setSampleRate failed: %s\n",
-				soapy_last_error());
+		if (param > 0)
+			set_sample_rate(s, (double)param);
 		break;
 
 	case 0x03:	/* set tuner gain mode: 0 = automatic, 1 = manual */
@@ -695,13 +868,14 @@ static int process_commands(sdr_ctx_t *s, int fd, uint8_t *buf, size_t *buflen)
 /* Stream until the client goes away or a command changes the configuration. */
 static void serve_client(sdr_ctx_t *s, int fd)
 {
-	uint8_t *inbuf, *outbuf;
+	uint8_t *inbuf, *ubuf, *outbuf;
 	void *buffs[1];
 	uint8_t cmd_buf[5];
 	size_t cmd_len = 0;
 	unsigned long overflows = 0;
 
 	inbuf = xmalloc(s->read_elems * s->in_elem_bytes);
+	ubuf = xmalloc(s->read_elems * 2);
 	outbuf = xmalloc(s->read_elems * 2);
 	buffs[0] = inbuf;
 
@@ -739,13 +913,21 @@ static void serve_client(sdr_ctx_t *s, int fd)
 		if (n == 0)
 			continue;
 
-		convert_to_u8(s, inbuf, (size_t)n, outbuf);
-		if (send_all(fd, outbuf, (size_t)n * 2) != 0)
-			break;
+		convert_to_u8(s, inbuf, (size_t)n, ubuf);
+		if (s->decim.factor > 1) {
+			size_t m = decimator_process(&s->decim, ubuf, (size_t)n,
+						     outbuf);
+			if (send_all(fd, outbuf, m * 2) != 0)
+				break;
+		} else {
+			if (send_all(fd, ubuf, (size_t)n * 2) != 0)
+				break;
+		}
 	}
 
 	SoapySDRDevice_deactivateStream(s->dev, s->stream, 0, 0);
 	free(inbuf);
+	free(ubuf);
 	free(outbuf);
 }
 
@@ -763,6 +945,8 @@ int main(int argc, char **argv)
 	int have_gain = 0;
 	int biastee = 0;
 	int tuner_type = DEFAULT_TUNER_TYPE;
+	int decim_enabled = 1;
+	double min_hw_rate = DEFAULT_MIN_HW_RATE;
 	sdr_ctx_t sdr;
 	struct addrinfo hints;
 	struct addrinfo *ai_head = NULL;
@@ -868,6 +1052,16 @@ int main(int argc, char **argv)
 			tuner_type = atoi(argv[i]);
 		} else if (!strncmp(a, "--tuner-type=", 13)) {
 			tuner_type = atoi(a + 13);
+		} else if (!strcmp(a, "--no-decimate")) {
+			decim_enabled = 0;
+		} else if (!strcmp(a, "--min-hw-rate")) {
+			if (++i >= argc) {
+				fprintf(stderr, "rtl_tcp_soapy: %s needs a value\n", a);
+				return 1;
+			}
+			min_hw_rate = parse_hz(argv[i]);
+		} else if (!strncmp(a, "--min-hw-rate=", 14)) {
+			min_hw_rate = parse_hz(a + 14);
 		} else {
 			fprintf(stderr, "rtl_tcp_soapy: unknown option '%s'\n", a);
 			usage(argv[0]);
@@ -885,6 +1079,9 @@ int main(int argc, char **argv)
 
 	memset(&sdr, 0, sizeof(sdr));
 	sdr.channel = channel;
+	sdr.decim_enabled = decim_enabled;
+	sdr.min_hw_rate = min_hw_rate;
+	sdr.decim.factor = 1;
 	sdr.init.freq = frequency;
 	sdr.init.rate = sample_rate;
 	sdr.init.bandwidth = bandwidth;
@@ -917,6 +1114,7 @@ int main(int argc, char **argv)
 	build_gain_table(&sdr);
 
 	if (setup_stream(&sdr) != 0) {
+		decimator_free(&sdr.decim);
 		free(sdr.gain_table);
 		SoapySDRDevice_unmake(sdr.dev);
 		return 1;
@@ -939,6 +1137,7 @@ int main(int argc, char **argv)
 			addr, port, gai_strerror(ret));
 		SoapySDRDevice_closeStream(sdr.dev, sdr.stream);
 		SoapySDRDevice_unmake(sdr.dev);
+		decimator_free(&sdr.decim);
 		free(sdr.gain_table);
 		return 1;
 	}
@@ -961,6 +1160,7 @@ int main(int argc, char **argv)
 			addr, port, strerror(errno));
 		SoapySDRDevice_closeStream(sdr.dev, sdr.stream);
 		SoapySDRDevice_unmake(sdr.dev);
+		decimator_free(&sdr.decim);
 		free(sdr.gain_table);
 		return 1;
 	}
@@ -1038,6 +1238,7 @@ int main(int argc, char **argv)
 	close(listen_fd);
 	SoapySDRDevice_closeStream(sdr.dev, sdr.stream);
 	SoapySDRDevice_unmake(sdr.dev);
+	decimator_free(&sdr.decim);
 	free(sdr.gain_table);
 	return 0;
 }
