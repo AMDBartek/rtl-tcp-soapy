@@ -1,0 +1,80 @@
+.TH "rtl_tcp_soapy" 1 "1.0.0" "rtl-sdr-soapy" "User Commands"
+.SH NAME
+rtl_tcp_soapy \- an rtl_tcp compatible I/Q spectrum server backed by SoapySDR
+.SH DESCRIPTION
+Provides the same TCP wire protocol as
+.BR rtl_tcp (1)
+but uses a SoapySDR supported SDR device instead of an RTL2832 based
+DVB-T receiver.  This allows unmodified rtl_tcp clients (gr-osmosdr,
+gqrx, SDR#, ...) to use USRP, LimeSDR, PlutoSDR and other devices that
+SoapySDR can talk to.  The samples are converted to the unsigned 8 bit
+I/Q format expected by rtl_tcp clients, with zero represented by 127 or
+128.
+.LP
+The device configuration selected on the command line is re-applied for
+every new client, so a client that does not set the sample rate (several
+DAB clients rely on the rtl_tcp default of 2048000 Hz) always starts from
+a known state instead of inheriting the settings of the previous client.
+.LP
+The gain table advertised to clients is derived from the device's actual
+gain range at startup, so the highest gain index selects the highest gain
+the device supports.
+.SH SYNOPSIS
+.B  rtl_tcp_soapy [OPTIONS]
+.SH DEVICE OPTIONS
+.IP "--args <args>"
+SoapySDR device arguments, for example "driver=uhd".  When omitted the
+first device found is used.
+.IP "-c, --channel <n>"
+RX channel index (default: 0).
+.IP "-f, --freq <Hz>"
+Initial center frequency (default: 100000000).
+.IP "-s, --samplerate <Hz>"
+Initial sample rate (default: 2048000).
+.IP "-b, --bandwidth <Hz>"
+RF filter bandwidth (default: driver default).
+.IP "-g, --gain <dB>"
+Initial gain in dB and enables manual gain mode.  When omitted automatic
+gain control is used.
+.IP "-T, --bias-tee"
+Enable the bias tee at startup, when the device supports it.
+.SH SERVER OPTIONS
+.IP "--listen <addr>"
+Listen address as host:port, :port or host.
+.IP "-a, --addr <addr>"
+Listen address (default: 127.0.0.1).
+.IP "-p, --port <port>"
+Listen port (default: 1234).
+.SH COMPATIBILITY OPTIONS
+.IP "--tuner-type <n>"
+Spoofed RTL-SDR tuner type reported in the handshake (default: 5, R820T).
+.IP "-D, --direct-sampling"
+Accepted for compatibility and ignored.
+.IP "-h, --help"
+Show a help message.
+.SH EXAMPLES
+.IP "rtl_tcp_soapy --args \"driver=uhd\" --listen 127.0.0.1:1234"
+Serve a USRP on the default rtl_tcp port.
+.IP "rtl_tcp_soapy --args \"driver=lime\" --listen 0.0.0.0:1234 -f 100M -s 2.048M"
+Serve a LimeSDR on all interfaces at 100 MHz and 2.048 MSps.
+.LP
+Use the device argument 'rtl_tcp=<host>:<port>' in the OsmoSDR
+(gr-osmosdr) source to receive samples in GRC and control the frequency,
+gain and sample rate remotely.
+.SH SEE ALSO
+.BR rtl_tcp (1),
+.BR rtl_sdr (1),
+.BR rtl_test (1),
+.BR rtl_fm (1)
+.SH COPYRIGHT
+Copyright (c) 2026 the rtl-sdr contributors
+.LP
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 2 of the License, or
+(at your option) any later version.
+.LP
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
