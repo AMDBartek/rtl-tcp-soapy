@@ -70,6 +70,17 @@
 #define DEFAULT_MIN_HW_RATE	1024000.0
 #define MAX_DECIM_FACTOR	4096
 
+/*
+ * Decimation filter parameters.  A Kaiser window is used because it gives a
+ * controlled trade-off between passband ripple, stopband attenuation and
+ * transition width.  96 taps per decimation step keeps the response flat to
+ * within 0.02 dB over almost the whole output band (the previous Hamming
+ * design started rolling off at about half the band) while still suppressing
+ * aliases by DECIM_STOPBAND_DB a little above the band edge.
+ */
+#define DECIM_STOPBAND_DB	60.0	/* stopband attenuation target */
+#define DECIM_TAPS_PER_FACTOR	96	/* filter length grows with the factor */
+
 /* Structure sent to the client right after a connection is accepted. */
 typedef struct {			/* size must be 12 bytes */
 	char magic[4];
@@ -305,33 +316,73 @@ static void decimator_free(decimator_t *d)
 	d->phase = 0;
 }
 
+/* Zeroth order modified Bessel function of the first kind (series form). */
+static double bessel_i0(double x)
+{
+	double term = 1.0, sum = 1.0;
+	double y = 0.25 * x * x;
+	int k;
+
+	for (k = 1; k < 64; k++) {
+		term *= y / ((double)k * (double)k);
+		sum += term;
+		if (term < 1e-16 * sum)
+			break;
+	}
+	return sum;
+}
+
 /*
- * Design a Hamming windowed-sinc low pass filter and prepare the delay lines.
- * The cutoff is at the output Nyquist frequency, so the outer edges of the
- * requested band are filtered off before the samples are decimated.
+ * Kaiser window shape parameter for a target stopband attenuation.  The
+ * piecewise formulas are the standard Kaiser estimates.
+ */
+static double kaiser_beta(double atten_db)
+{
+	if (atten_db > 50.0)
+		return 0.1102 * (atten_db - 8.7);
+	if (atten_db >= 21.0)
+		return 0.5842 * pow(atten_db - 21.0, 0.4) +
+		       0.07886 * (atten_db - 21.0);
+	return 0.0;
+}
+
+/*
+ * Design a Kaiser windowed-sinc low pass filter and prepare the delay lines.
+ * The -6 dB point is placed at the output Nyquist frequency, so the transition
+ * band straddles the edge of the requested band: the passband stays flat to
+ * within 0.02 dB up to roughly 95% of Nyquist and aliases are suppressed by
+ * DECIM_STOPBAND_DB from roughly 105% on.  The filter is normalised so that
+ * its DC gain is exactly unity, so decimation does not change the signal
+ * level.
  */
 static void decimator_design(decimator_t *d, size_t factor)
 {
-	size_t n, i;
+	double atten_db = DECIM_STOPBAND_DB;
 	double fc = 0.5 / (double)factor;
-	double sum = 0.0;
+	double beta, i0beta, sum = 0.0;
+	size_t n, i;
 
 	decimator_free(d);
 
 	d->factor = factor;
-	d->ntaps = 16 * factor + 1;
+	d->ntaps = DECIM_TAPS_PER_FACTOR * factor + 1;
 	n = d->ntaps;
 
 	d->coeff = xmalloc(n * sizeof(float));
 	d->hist_i = xmalloc(n * sizeof(float));
 	d->hist_q = xmalloc(n * sizeof(float));
 
+	beta = kaiser_beta(atten_db);
+	i0beta = bessel_i0(beta);
+
 	for (i = 0; i < n; i++) {
 		double m = (double)i - (double)(n - 1) / 2.0;
 		double sinc = (m == 0.0) ? 1.0 :
 			sin(2.0 * M_PI * fc * m) / (2.0 * M_PI * fc * m);
-		double window = 0.54 - 0.46 *
-			cos(2.0 * M_PI * (double)i / (double)(n - 1));
+		double t = (n == 1) ? 0.0 :
+			(2.0 * (double)i / (double)(n - 1)) - 1.0;
+		double window = bessel_i0(beta * sqrt(1.0 - t * t)) / i0beta;
+
 		d->coeff[i] = (float)(2.0 * fc * sinc * window);
 		sum += d->coeff[i];
 	}
